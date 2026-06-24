@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}Erreur{% endblock %}
+
+{% block content %}
+<div class="flash error">{{ message }}</div>
+<a href="/espace?token={{ token }}" class="btn btn-secondary">← Retour à mon espace</a>
+{% endblock %}

@@ -1,0 +1,146 @@
+{% extends "base.html" %}
+{% block title %}Mon espace – {{ email }}{% endblock %}
+
+{% block content %}
+
+{# Flash messages #}
+{% if request.query_params.get("ok") == "reserver" %}
+  <div class="flash">Réservation confirmée !</div>
+{% elif request.query_params.get("ok") == "annuler" %}
+  <div class="flash">Réservation annulée.</div>
+{% elif request.query_params.get("ok") == "signaler" %}
+  <div class="flash">Votre signalement a bien été transmis.</div>
+{% endif %}
+
+<p class="muted">Connecté en tant que <strong>{{ email }}</strong></p>
+
+{# ------------------------------------------------------------------ #}
+{# Crédits                                                             #}
+{# ------------------------------------------------------------------ #}
+<h2>Mes formules</h2>
+
+{% if not credits %}
+  <p class="muted">Aucune formule active.</p>
+{% else %}
+  {% for c in credits %}
+  <div class="card">
+    <div class="row">
+      <div style="flex:1">
+        <strong>{{ c.type_cours.value }}</strong>
+        <span class="badge {% if c.statut != 'actif' %}expire{% endif %}">{{ c.formule.value }}</span>
+      </div>
+      {% if c.formule.value not in ('ABO',) %}
+        <span class="muted">{{ c.credits_restants }} crédit(s) restant(s)</span>
+      {% else %}
+        <span class="muted">Illimité</span>
+      {% endif %}
+      {% if c.date_expiration %}
+        <span class="muted">expire le {{ c.date_expiration.strftime('%d/%m/%Y') }}</span>
+      {% endif %}
+      <span class="badge {% if c.statut != 'actif' %}expire{% endif %}">{{ c.statut }}</span>
+    </div>
+  </div>
+  {% endfor %}
+{% endif %}
+
+{# ------------------------------------------------------------------ #}
+{# Réservations à venir                                                #}
+{# ------------------------------------------------------------------ #}
+<h2>Mes réservations à venir</h2>
+
+{% if not resas %}
+  <p class="muted">Aucune réservation confirmée.</p>
+{% else %}
+  {% for item in resas %}
+  {% set r = item.resa %}
+  {% set c = item.creneau %}
+  <div class="card">
+    <div class="row">
+      <div style="flex:1">
+        <strong>{{ c.type_cours.value if c else r.id_creneau }}</strong>
+        <span class="muted" style="margin-left:8px">
+          {{ r.date_seance.strftime('%A %d %B %Y à %H:%M') }}
+        </span>
+      </div>
+      {% if item.peut_annuler %}
+        <form method="post" action="/espace/annuler?token={{ token }}">
+          <input type="hidden" name="id_resa" value="{{ r.id_resa }}">
+          <input type="hidden" name="token" value="{{ token }}">
+          <button class="btn-danger" type="submit"
+            onclick="return confirm('Annuler cette réservation ?')">
+            Annuler
+          </button>
+        </form>
+      {% else %}
+        <form method="post" action="/espace/signaler?token={{ token }}" id="form-signal-{{ r.id_resa }}">
+          <input type="hidden" name="id_creneau" value="{{ r.id_creneau }}">
+          <input type="hidden" name="token" value="{{ token }}">
+          <button type="button" class="btn-secondary"
+            onclick="document.getElementById('signal-{{ r.id_resa }}').style.display='block'">
+            Signaler absence
+          </button>
+          <div id="signal-{{ r.id_resa }}" style="display:none; margin-top:10px">
+            <label>Motif (obligatoire)
+              <textarea name="motif" rows="2" required></textarea>
+            </label>
+            <button type="submit" class="btn-primary" style="margin-top:6px">Envoyer</button>
+          </div>
+        </form>
+      {% endif %}
+    </div>
+  </div>
+  {% endfor %}
+{% endif %}
+
+{# ------------------------------------------------------------------ #}
+{# Nouvelle réservation                                                #}
+{# ------------------------------------------------------------------ #}
+<h2>Réserver un cours</h2>
+
+{% set credits_actifs = credits | selectattr("statut", "eq", "actif") | list %}
+{% if not credits_actifs %}
+  <p class="muted">Aucune formule active pour réserver.</p>
+{% else %}
+<div class="card">
+  <form method="post" action="/espace/reserver?token={{ token }}">
+    <input type="hidden" name="token" value="{{ token }}">
+
+    <label>Formule à utiliser
+      <select name="id_credit_index" required style="margin-bottom:12px">
+        {% for c in credits %}
+          {% if c.statut == "actif" %}
+          <option value="{{ loop.index0 }}">
+            {{ c.type_cours.value }} — {{ c.formule.value }}
+            {% if c.formule.value not in ('ABO',) %}({{ c.credits_restants }} crédit(s)){% endif %}
+          </option>
+          {% endif %}
+        {% endfor %}
+      </select>
+    </label>
+
+    <label>Créneau
+      <select name="id_creneau" required style="margin-bottom:12px">
+        {% for cr in creneaux %}
+          {% set plein = cr.places_prises >= cr.capacite %}
+          <option value="{{ cr.id_creneau }}" {% if plein %}disabled{% endif %}>
+            {{ cr.type_cours.value }}
+            {% if plein %}— COMPLET ({{ cr.places_prises }}/{{ cr.capacite }})
+            {% else %}({{ cr.places_prises }}/{{ cr.capacite }} places){% endif %}
+          </option>
+        {% endfor %}
+      </select>
+    </label>
+
+    <label>Date de la séance
+      <input type="datetime-local" name="date_seance" required
+             min="{{ maintenant.strftime('%Y-%m-%dT%H:%M') }}"
+             style="width:100%; padding:8px; border:1px solid #ccc; border-radius:4px;
+                    font-size:0.9rem; margin-top:4px; margin-bottom:12px">
+    </label>
+
+    <button type="submit" class="btn-primary">Confirmer la réservation</button>
+  </form>
+</div>
+{% endif %}
+
+{% endblock %}
