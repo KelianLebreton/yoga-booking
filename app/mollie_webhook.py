@@ -77,6 +77,46 @@ async def webhook_mollie(
 
 
 # ---------------------------------------------------------------------------
+# Diagnostic TEMPORAIRE : inspecter les derniers paiements via l'API Mollie
+# (à retirer ensuite). Protégé par ?key=<ADMIN_KEY>.
+# ---------------------------------------------------------------------------
+
+@router.get("/debug/mollie-payments")
+async def debug_mollie_payments(request: Request) -> dict:
+    import httpx
+
+    admin_key = os.environ.get("ADMIN_KEY", "")
+    if not admin_key or request.query_params.get("key") != admin_key:
+        raise HTTPException(status_code=403, detail="Clé invalide.")
+
+    api_key = os.environ["MOLLIE_API_KEY"]
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            "https://api.mollie.com/v2/payments?limit=10",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=15.0,
+        )
+    data = resp.json()
+    payments = (data.get("_embedded", {}) or {}).get("payments", [])
+
+    for p in payments:
+        logger.warning(
+            "Mollie payment — id=%s mode=%s status=%s desc=%r metadata=%r "
+            "orderId=%s amount=%r links=%r",
+            p.get("id"), p.get("mode"), p.get("status"), p.get("description"),
+            p.get("metadata"), p.get("orderId"), p.get("amount"),
+            list((p.get("_links") or {}).keys()),
+        )
+
+    return {
+        "http_status": resp.status_code,
+        "count": len(payments),
+        "modes": [p.get("mode") for p in payments],
+        "statuses": [p.get("status") for p in payments],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Traitement d'un paiement confirmé
 # ---------------------------------------------------------------------------
 
