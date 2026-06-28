@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import logging
 import os
 from datetime import date
@@ -55,22 +56,24 @@ async def webhook_mollie(
 
     _verifier_signature(body, x_mollie_signature)
 
-    form = await request.form()
-    payment_id: str = form.get("id", "")
-    if not payment_id:
-        raise HTTPException(status_code=400, detail="Champ 'id' manquant dans le webhook.")
+    # Webhook "organisation" Mollie : corps JSON { "type": "...", ... }
+    try:
+        payload = json.loads(body) if body else {}
+    except ValueError:
+        logger.warning("Webhook Mollie : corps non-JSON, ignoré.")
+        return {"detail": "corps non-JSON"}
 
-    paiement = await _fetch_paiement(payment_id)
+    event_type = payload.get("type", "")
 
-    if paiement["status"] != "paid":
-        return {"detail": "statut ignoré", "status": paiement["status"]}
+    # Ping de connectivité envoyé par le bouton "test" de Mollie → on accuse réception
+    if event_type == "hook.ping":
+        return {"detail": "pong"}
 
-    order = None
-    if paiement.get("orderId"):
-        order = await _fetch_order(paiement["orderId"])
-
-    await _traiter_paiement(paiement, order)
-    return {"detail": "ok"}
+    # TODO : traiter payment-link.paid / payment.paid une fois la structure réelle
+    # connue. Pour l'instant on logge le payload complet (voir log ci-dessus) et on
+    # accuse réception (200) pour éviter les relances Mollie.
+    logger.warning("Webhook Mollie — type=%r pas encore traité — payload=%r", event_type, payload)
+    return {"detail": "reçu", "type": event_type}
 
 
 # ---------------------------------------------------------------------------
