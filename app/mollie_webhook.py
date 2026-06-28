@@ -46,7 +46,7 @@ async def webhook_mollie(
     body = await request.body()
 
     # --- LOG TEMPORAIRE DE DIAGNOSTIC (à retirer une fois le format identifié) ---
-    logger.info(
+    logger.warning(
         "Webhook Mollie reçu — content-type=%r — body=%r",
         request.headers.get("content-type"),
         body.decode("utf-8", "replace")[:2000],
