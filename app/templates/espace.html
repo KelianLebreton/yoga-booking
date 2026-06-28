@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Mon espace – {{ email }}{% endblock %}
+{% block title %}Mon espace – {{ nom }}{% endblock %}
 
 {% block content %}
 
@@ -12,7 +12,7 @@
   <div class="flash">Votre signalement a bien été transmis.</div>
 {% endif %}
 
-<p class="muted">Connecté en tant que <strong>{{ email }}</strong></p>
+<p class="muted">Connecté en tant que <strong>{{ nom }}</strong></p>
 
 {# ------------------------------------------------------------------ #}
 {# Crédits                                                             #}
@@ -25,7 +25,7 @@
   {% for c in credits %}
   <div class="card">
     <div class="row">
-      <div style="flex:1">
+      <div class="flex-1">
         <strong>{{ c.type_cours.value }}</strong>
         <span class="badge {% if c.statut != 'actif' %}expire{% endif %}">{{ c.formule.value }}</span>
       </div>
@@ -56,9 +56,9 @@
   {% set c = item.creneau %}
   <div class="card">
     <div class="row">
-      <div style="flex:1">
+      <div class="flex-1">
         <strong>{{ c.type_cours.value if c else r.id_creneau }}</strong>
-        <span class="muted" style="margin-left:8px">
+        <span class="muted ml-8">
           {{ r.date_seance.strftime('%A %d %B %Y à %H:%M') }}
         </span>
       </div>
@@ -79,11 +79,11 @@
             onclick="document.getElementById('signal-{{ r.id_resa }}').style.display='block'">
             Signaler absence
           </button>
-          <div id="signal-{{ r.id_resa }}" style="display:none; margin-top:10px">
+          <div id="signal-{{ r.id_resa }}" class="signal-panel">
             <label>Motif (obligatoire)
               <textarea name="motif" rows="2" required></textarea>
             </label>
-            <button type="submit" class="btn-primary" style="margin-top:6px">Envoyer</button>
+            <button type="submit" class="btn-primary mt-6">Envoyer</button>
           </div>
         </form>
       {% endif %}
@@ -106,7 +106,7 @@
     <input type="hidden" name="token" value="{{ token }}">
 
     <label>Formule à utiliser
-      <select name="id_credit_index" required style="margin-bottom:12px">
+      <select name="id_credit_index" id="select-credit" required>
         {% for c in credits %}
           {% if c.statut == "actif" %}
           <option value="{{ loop.index0 }}">
@@ -118,29 +118,80 @@
       </select>
     </label>
 
-    <label>Créneau
-      <select name="id_creneau" required style="margin-bottom:12px">
-        {% for cr in creneaux %}
-          {% set plein = cr.places_prises >= cr.capacite %}
-          <option value="{{ cr.id_creneau }}" {% if plein %}disabled{% endif %}>
-            {{ cr.type_cours.value }}
-            {% if plein %}— COMPLET ({{ cr.places_prises }}/{{ cr.capacite }})
-            {% else %}({{ cr.places_prises }}/{{ cr.capacite }} places){% endif %}
-          </option>
-        {% endfor %}
+    <label>Type de cours
+      <select id="select-type" required>
+        <option value="">— choisissez d'abord une formule —</option>
       </select>
     </label>
 
     <label>Date de la séance
-      <input type="datetime-local" name="date_seance" required
-             min="{{ maintenant.strftime('%Y-%m-%dT%H:%M') }}"
-             style="width:100%; padding:8px; border:1px solid #ccc; border-radius:4px;
-                    font-size:0.9rem; margin-top:4px; margin-bottom:12px">
+      <input type="date" id="select-jour" min="{{ today }}" required>
+    </label>
+
+    <label>Créneau
+      <select name="session" id="select-creneau" required>
+        <option value="">— choisissez d'abord une date —</option>
+      </select>
     </label>
 
     <button type="submit" class="btn-primary">Confirmer la réservation</button>
   </form>
 </div>
+
+<script>
+const sessionsParType = {{ sessions_par_type | safe }};
+const typesParCredit  = {{ types_par_credit | safe }};
+
+// Formule -> liste des types de cours réservables avec ce crédit
+function majTypes() {
+  const idx = document.getElementById('select-credit').value;
+  const sel = document.getElementById('select-type');
+  sel.innerHTML = '';
+  const types = typesParCredit[idx] || [];
+  if (!types.length) {
+    sel.innerHTML = '<option value="">Aucun cours disponible pour cette formule</option>';
+  } else {
+    types.forEach(t => {
+      const opt = document.createElement('option');
+      opt.value = t;
+      opt.textContent = t;
+      sel.appendChild(opt);
+    });
+  }
+  majCreneaux();
+}
+
+// Type + date -> créneaux de ce type ce jour-là (avec places restantes)
+function majCreneaux() {
+  const type = document.getElementById('select-type').value;
+  const jour = document.getElementById('select-jour').value;
+  const sel = document.getElementById('select-creneau');
+  sel.innerHTML = '';
+
+  // On ne déroule les créneaux qu'une fois une date choisie
+  if (!jour) {
+    sel.innerHTML = '<option value="">— choisissez d\'abord une date —</option>';
+    return;
+  }
+
+  const sessions = (sessionsParType[type] || []).filter(s => s.date === jour);
+  if (!sessions.length) {
+    sel.innerHTML = '<option value="">Aucun créneau disponible ce jour</option>';
+    return;
+  }
+  sessions.forEach(s => {
+    const opt = document.createElement('option');
+    opt.value = s.value;
+    opt.textContent = s.label;
+    sel.appendChild(opt);
+  });
+}
+
+document.getElementById('select-credit').addEventListener('change', majTypes);
+document.getElementById('select-type').addEventListener('change', majCreneaux);
+document.getElementById('select-jour').addEventListener('change', majCreneaux);
+majTypes();
+</script>
 {% endif %}
 
 {% endblock %}

@@ -200,10 +200,14 @@ class SheetsClient:
                 id_creneau=str(row["id_créneau"]),
                 type_cours=TypeCours(row["type_cours"]),
                 capacite=int(row["capacité"]),
-                places_prises=int(row["places_prises"]),
+                # places_prises n'est plus stocké dans Créneaux : le nombre de
+                # places prises est dérivé par date via count_reservations_date().
+                # On laisse 0 ici (valeur écrasée avant toute décision métier).
+                places_prises=int(row.get("places_prises", 0) or 0),
                 jour_semaine=str(row.get("jour_semaine", "")),
                 heure=str(row.get("heure", "")),
                 lieu=str(row.get("lieu", "")),
+                date=str(row.get("date", "")),
             ))
         return creneaux
 
@@ -214,23 +218,31 @@ class SheetsClient:
                 return c
         return None
 
-    def incrementer_places_prises(self, id_creneau: str) -> None:
-        """Incrémente places_prises de 1 pour le créneau donné."""
-        self._update_places(id_creneau, delta=+1)
+    def count_reservations_date(self, id_creneau: str, date_seance: datetime) -> int:
+        """Compte les réservations confirmées pour un créneau à une date précise."""
+        ws = self._tab(_TAB_RESERVATIONS)
+        date_str = self._fmt_datetime(date_seance)
+        return sum(
+            1 for row in ws.get_all_records()
+            if str(row["id_créneau"]) == id_creneau
+            and str(row["date_séance"]) == date_str
+            and row["statut"] == "confirmé"
+        )
 
-    def decrementer_places_prises(self, id_creneau: str) -> None:
-        """Décrémente places_prises de 1 pour le créneau donné."""
-        self._update_places(id_creneau, delta=-1)
+    def count_reservations_par_session(self) -> dict[tuple[str, str], int]:
+        """
+        Compte les réservations confirmées groupées par (id_créneau, date_séance).
+        Un seul appel réseau — à utiliser pour calculer les places de nombreuses
+        séances d'un coup. La clé date est au format "%Y-%m-%dT%H:%M".
+        """
+        from collections import Counter
 
-    def _update_places(self, id_creneau: str, delta: int) -> None:
-        ws = self._tab(_TAB_CRENEAUX)
-        records = ws.get_all_records()
-        for i, row in enumerate(records, start=2):
-            if str(row["id_créneau"]) == id_creneau:
-                new_val = int(row["places_prises"]) + delta
-                # places_prises est la 7e colonne (G)
-                ws.update_cell(i, 7, max(0, new_val))
-                return
+        ws = self._tab(_TAB_RESERVATIONS)
+        compteur: Counter[tuple[str, str]] = Counter()
+        for row in ws.get_all_records():
+            if row["statut"] == "confirmé":
+                compteur[(str(row["id_créneau"]), str(row["date_séance"]))] += 1
+        return dict(compteur)
 
     # ------------------------------------------------------------------
     # Réservations

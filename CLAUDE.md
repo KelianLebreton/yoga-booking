@@ -69,8 +69,10 @@ Cancellation window: if `now >= session_datetime - 24h`, the cancel button is di
 
 Product reference must be `[TYPE_COURS]_[FORMULE]` — this is parsed by `mollie_webhook.py`.
 
-- `TYPE_COURS`: `AERIEN`, `VINYASA`, `ASHTANGA`, `PRENATAL`, `AYURVEDA`, `FACIAL`
+- `TYPE_COURS`: `AERIEN`, `VINYASA`, `ASHTANGA`, `PRENATAL`, `AYURVEDA`, `FACIAL`, and combined types `ASHTANGA_VINYASA`, `AERIEN_ASHTANGA_VINYASA`, `AERIEN_ETE`
 - `FORMULE`: `ESSAI`, `UNITE`, `C5`, `C10`, `C20`, `ABO`
+
+Combined credit types cover multiple course types: `ASHTANGA_VINYASA` covers Ashtanga + Vinyasa; `AERIEN_ASHTANGA_VINYASA` covers all three. Compatibility logic is in `booking_logic.py::credit_compatible_avec_creneau`.
 
 The display name on the website can be anything; only the SKU/reference field matters.
 
@@ -82,7 +84,7 @@ Health information (pregnancy, injuries, medical certificates, minors) must **ne
 
 - **Élèves**: `email | nom | téléphone | contact_urgence`
 - **Crédits**: `email | type_cours | formule | credits_restants | date_expiration | statut` (one row per purchased formula; a student can have multiple rows)
-- **Créneaux**: `id_créneau | type_cours | jour_semaine | heure | lieu | capacité | places_prises`
+- **Créneaux**: `id_créneau | type_cours | jour_semaine | heure | lieu | capacité` — un créneau est un modèle récurrent (ex: lundi 9h). Le nombre de places prises **n'est pas stocké ici** : il est dérivé par séance datée en comptant les `Réservations` confirmées (`sheets_client.count_reservations_date`). L'ancienne colonne `places_prises` est obsolète.
 - **Réservations**: `id_résa | email_élève | id_créneau | date_séance | date_résa | statut` (statuts: `confirmé`, `annulé_à_temps`, `annulé_tardif_signalé`, `effectué`)
 - **Signalements**: `email | id_créneau | horodatage | motif`
 

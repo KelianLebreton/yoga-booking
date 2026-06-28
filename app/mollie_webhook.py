@@ -21,7 +21,7 @@ from datetime import date
 from fastapi import APIRouter, Header, HTTPException, Request, status
 
 from auth import creer_token_eleve
-from booking_logic import credits_apres_achat, parse_product_name
+from booking_logic import TypeCours, Formule, credits_apres_achat
 from email_client import envoyer_lien_espace
 from sheets_client import get_sheets_client
 
@@ -55,11 +55,13 @@ async def webhook_mollie(
     paiement = await _fetch_paiement(payment_id)
 
     if paiement["status"] != "paid":
-        # Mollie envoie le webhook pour chaque transition de statut ;
-        # on ignore les statuts intermédiaires (open, pending, failed…)
         return {"detail": "statut ignoré", "status": paiement["status"]}
 
-    await _traiter_paiement(paiement)
+    order = None
+    if paiement.get("orderId"):
+        order = await _fetch_order(paiement["orderId"])
+
+    await _traiter_paiement(paiement, order)
     return {"detail": "ok"}
 
 
@@ -67,34 +69,41 @@ async def webhook_mollie(
 # Traitement d'un paiement confirmé
 # ---------------------------------------------------------------------------
 
-async def _traiter_paiement(paiement: dict) -> None:
+async def _traiter_paiement(paiement: dict, order: dict | None = None) -> None:
     """
     Parse la référence produit, crée/met à jour l'élève, ajoute la ligne
     Crédits et envoie le lien espace élève.
+
+    Webador crée des orders Mollie : l'email vient de billingAddress et la
+    référence produit du champ SKU des lignes (champ "référence" dans Webador).
     """
-    # Métadonnées attendues dans le paiement Mollie
     metadata = paiement.get("metadata", {}) or {}
     email: str = (metadata.get("email") or "").strip().lower()
     nom: str = (metadata.get("nom") or "").strip()
     telephone: str = (metadata.get("telephone") or "").strip()
 
+    if order:
+        billing = order.get("billingAddress", {}) or {}
+        if not email:
+            email = (billing.get("email") or "").strip().lower()
+        if not nom:
+            prenom = (billing.get("givenName") or "").strip()
+            famille = (billing.get("familyName") or "").strip()
+            nom = f"{prenom} {famille}".strip()
+        if not telephone:
+            telephone = (billing.get("phone") or "").strip()
+
     if not email:
-        logger.error("Paiement %s sans email dans metadata", paiement.get("id"))
+        logger.error("Paiement %s sans email (ni metadata ni billingAddress)", paiement.get("id"))
         return
 
-    # Référence produit : on la cherche dans les lignes de commande Mollie
-    reference = _extraire_reference(paiement)
-    if not reference:
-        logger.error(
-            "Paiement %s : impossible d'extraire la référence produit", paiement.get("id")
+    produit = _identifier_produit(order or paiement)
+    if produit is None:
+        logger.warning(
+            "Paiement %s : produit non reconnu dans le catalogue — ignoré", paiement.get("id")
         )
         return
-
-    try:
-        type_cours, formule = parse_product_name(reference)
-    except Exception as exc:
-        logger.error("Paiement %s : référence invalide '%s' — %s", paiement.get("id"), reference, exc)
-        return
+    type_cours, formule = produit
 
     credits_initiaux, date_expiration = credits_apres_achat(formule, date.today())
 
@@ -115,30 +124,66 @@ async def _traiter_paiement(paiement: dict) -> None:
     logger.info("Paiement %s traité : %s / %s pour %s", paiement.get("id"), type_cours, formule, email)
 
 
-def _extraire_reference(paiement: dict) -> str | None:
-    """
-    Cherche la référence produit dans les lignes de commande Mollie
-    (champ `lines[].sku` ou `lines[].description` selon la configuration).
+# Mapping nom Webador (normalisé) → (TypeCours, Formule)
+# Les noms sont en minuscules sans espaces superflus pour la comparaison.
+_CATALOGUE: dict[str, tuple[TypeCours, Formule]] = {
+    "yoga aérien/ashtanga/vinyasa ; séance découverte": (TypeCours.AERIEN_ASHTANGA_VINYASA, Formule.ESSAI),
+    "yoga sonore et yoga aérien": (TypeCours.AERIEN, Formule.C10),
+    "stage yoga aérien": (TypeCours.AERIEN, Formule.STAGE),
+    "3 séances offre special"
+    "séances d'été ashtanga/vinyasa"
+    "séances d'été yoga aérien"
+    "séance personnalisée"
+    "ashtanga & flow yoga carte de 5"
+    "yoga aérien carte de 5"
+    "ashtanga & flow yoga carte de 10"
+    "yoga aérien carte de 10":                    (TypeCours.AERIEN, Formule.C10),
+    
+    "yoga aérien à la carte de 5":                     (TypeCours.AERIEN, Formule.C5),
+    "ashtanga & flow yoga carte de 10":                 (TypeCours.ASHTANGA_VINYASA, Formule.C10),
+    "ashtanga & flow yoga carte de 5 sèances":          (TypeCours.ASHTANGA_VINYASA, Formule.C5),
+    "ashtanga & flow yoga carte de 5 séances":          (TypeCours.ASHTANGA_VINYASA, Formule.C5),
+    "séances d'été ashtanga / vinyasa":                 (TypeCours.ASHTANGA_VINYASA, Formule.C5),
+    "séances d'été yoga aérien":                        (TypeCours.AERIEN_ETE, Formule.C5),
+}
 
-    L'intégration Webador doit placer la référence dans le SKU de chaque ligne.
-    Si plusieurs lignes sont présentes (panier), on prend la première — les paniers
-    multi-produits Mollie/Webador doivent être évités pour ce projet (un achat = un produit).
-    """
-    lines = (paiement.get("lines") or [])
-    if lines:
-        sku = (lines[0].get("sku") or "").strip()
-        if sku:
-            return sku
-        # Fallback : description si le SKU n'est pas rempli
-        return (lines[0].get("description") or "").strip() or None
 
-    # Pour les paiements simples (sans order lines), on regarde la description
-    return (paiement.get("description") or "").strip() or None
+def _identifier_produit(data: dict) -> tuple[TypeCours, Formule] | None:
+    """
+    Identifie le produit acheté à partir du nom de la première ligne du panier Mollie.
+    Retourne None si le produit n'est pas dans le catalogue (retreat, stage, etc.).
+    """
+    lines = data.get("lines") or []
+    nom = (lines[0].get("name") or "").strip().lower() if lines else ""
+    if not nom:
+        nom = (data.get("description") or "").strip().lower()
+    return _CATALOGUE.get(nom)
 
 
 # ---------------------------------------------------------------------------
-# Appel API Mollie
+# Appels API Mollie
 # ---------------------------------------------------------------------------
+
+async def _fetch_order(order_id: str) -> dict:
+    """Récupère un order Mollie avec ses lignes pour avoir le SKU et l'email client."""
+    import httpx
+
+    api_key = os.environ["MOLLIE_API_KEY"]
+    url = f"https://api.mollie.com/v2/orders/{order_id}?embed=lines"
+
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            url,
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=10.0,
+        )
+
+    if response.status_code != 200:
+        logger.error("Mollie Orders API %s pour order %s", response.status_code, order_id)
+        return {}
+
+    return response.json()
+
 
 async def _fetch_paiement(payment_id: str) -> dict:
     """Récupère les détails d'un paiement via l'API Mollie REST."""

@@ -21,13 +21,35 @@ class TypeCours(str, Enum):
     VINYASA = "VINYASA"
     ASHTANGA = "ASHTANGA"
     PRENATAL = "PRENATAL"
+    POSTNATAL = "POSTNATAL"
     AYURVEDA = "AYURVEDA"
     FACIAL = "FACIAL"
+    PERSO = "PERSO"
+    # Types combinés : un crédit valable pour plusieurs types de cours
+    ASHTANGA_VINYASA = "ASHTANGA_VINYASA"
+    AERIEN_ASHTANGA_VINYASA = "AERIEN_ASHTANGA_VINYASA"
+    AERIEN_ETE = "AERIEN_ETE"
+    ASHTANGA_VINYASA_ETE = "ASHTANGA_VINYASA_ETE"
+
+# Quels types de cours un crédit combiné peut couvrir
+_TYPES_COMPATIBLES: dict[TypeCours, frozenset[TypeCours]] = {
+    TypeCours.ASHTANGA_VINYASA: frozenset({TypeCours.ASHTANGA, TypeCours.VINYASA}),
+    TypeCours.AERIEN_ASHTANGA_VINYASA: frozenset({TypeCours.AERIEN, TypeCours.ASHTANGA, TypeCours.VINYASA}),
+}
+
+
+def credit_compatible_avec_creneau(credit_type: TypeCours, creneau_type: TypeCours) -> bool:
+    """Un crédit est compatible si son type correspond exactement ou le couvre (type combiné)."""
+    if credit_type == creneau_type:
+        return True
+    return creneau_type in _TYPES_COMPATIBLES.get(credit_type, frozenset())
 
 
 class Formule(str, Enum):
     ESSAI = "ESSAI"
+    STAGE = "STAGE"
     UNITE = "UNITE"
+    C3 = "C3"
     C5 = "C5"
     C10 = "C10"
     C20 = "C20"
@@ -36,7 +58,9 @@ class Formule(str, Enum):
 
 CREDITS_PAR_FORMULE: dict[Formule, int] = {
     Formule.ESSAI: 1,
+    Formule.STAGE : 1,
     Formule.UNITE: 1,
+    Formule.C3: 3,
     Formule.C5: 5,
     Formule.C10: 10,
     Formule.C20: 20,
@@ -46,6 +70,8 @@ CREDITS_PAR_FORMULE: dict[Formule, int] = {
 DUREE_VALIDITE_MOIS: dict[Formule, Optional[int]] = {
     Formule.ESSAI: None,   # consommé immédiatement, pas d'expiration utile
     Formule.UNITE: None,
+    Formule.STAGE : None,
+    Formule.C3: 1, #Validité en mois
     Formule.C5: 3,
     Formule.C10: 6,
     Formule.C20: 12,
@@ -53,10 +79,10 @@ DUREE_VALIDITE_MOIS: dict[Formule, Optional[int]] = {
 }
 
 # Formules dont le crédit est débité à l'achat (non à la réservation)
-DEBIT_A_LACHAT: frozenset[Formule] = frozenset({Formule.ESSAI, Formule.UNITE})
+DEBIT_A_LACHAT: frozenset[Formule] = frozenset({Formule.ESSAI, Formule.UNITE, Formule.STAGE})
 
 # Formules jamais recrédités en cas d'annulation
-JAMAIS_RECREDITE: frozenset[Formule] = frozenset({Formule.ESSAI, Formule.UNITE})
+JAMAIS_RECREDITE: frozenset[Formule] = frozenset({Formule.ESSAI, Formule.UNITE, Formule.STAGE})
 
 DELAI_ANNULATION = timedelta(hours=24)
 
@@ -80,8 +106,9 @@ class Creneau:
     capacite: int
     places_prises: int
     jour_semaine: str = ""   # ex: "lundi"
-    heure: str = ""          # ex: "09:00"
+    heure: str = ""          # ex: "09:00" ou "09:00:00"
     lieu: str = ""           # ex: "Salle A"
+    date: str = ""           # date de la séance, ex: "22/06/2026" (vide si créneau récurrent)
 
 
 @dataclass(frozen=True)
@@ -92,6 +119,34 @@ class Reservation:
     id_creneau: str
     date_seance: datetime
     statut: str  # "confirmé" | "annulé_à_temps" | "annulé_tardif_signalé" | "effectué"
+
+
+def creneau_datetime(creneau: Creneau) -> Optional[datetime]:
+    """
+    Datetime d'une séance datée à partir des champs `date` + `heure` du créneau.
+    Retourne None si l'un est vide ou illisible (créneau récurrent sans date).
+    Accepte plusieurs formats (selon ce que renvoie Google Sheets).
+    """
+    d, h = creneau.date.strip(), creneau.heure.strip()
+    if not d or not h:
+        return None
+    date_part = None
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
+        try:
+            date_part = datetime.strptime(d, fmt).date()
+            break
+        except ValueError:
+            continue
+    time_part = None
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            time_part = datetime.strptime(h, fmt).time()
+            break
+        except ValueError:
+            continue
+    if date_part is None or time_part is None:
+        return None
+    return datetime.combine(date_part, time_part)
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +166,7 @@ def parse_product_name(reference: str) -> tuple[TypeCours, Formule]:
     Parse une référence produit Mollie du format TYPE_COURS_FORMULE.
     Lève BookingError si le format est invalide.
     """
-    parts = reference.strip().upper().split("_")
+    parts = reference.strip().upper().rsplit("_", 1)
     if len(parts) != 2:
         raise BookingError(f"Référence produit invalide : '{reference}' (attendu TYPE_COURS_FORMULE)")
 
@@ -135,11 +190,12 @@ def parse_product_name(reference: str) -> tuple[TypeCours, Formule]:
 def credits_apres_achat(formule: Formule, date_achat: date) -> tuple[int, Optional[date]]:
     """
     Retourne (credits_initiaux, date_expiration) pour une formule achetée.
-    ESSAI/UNITE : crédit débité immédiatement → 0 restant (déjà consommé).
+    ESSAI/UNITE/STAGE : une séance à réserver (non remboursable, cf. JAMAIS_RECREDITE),
+    sans expiration. Le crédit est décrémenté lors de la réservation.
     ABO : 0 crédits (pas de décompte), expiration fin juin de la saison courante.
     """
     if formule in DEBIT_A_LACHAT:
-        return 0, None
+        return CREDITS_PAR_FORMULE[formule], None
 
     if formule == Formule.ABO:
         expiration = _fin_saison_abo(date_achat)
@@ -188,11 +244,21 @@ def valider_reservation(
     Vérifie qu'une réservation est possible. Lève BookingError si non.
     Ne fait aucune écriture — la persistance est à la charge de l'appelant.
     """
-    # Cohérence type de cours
-    if credit.type_cours != creneau.type_cours:
+    # Cohérence type de cours (types combinés acceptés)
+    if not credit_compatible_avec_creneau(credit.type_cours, creneau.type_cours):
         raise BookingError(
             f"Ce crédit est pour '{credit.type_cours}', pas pour '{creneau.type_cours}'"
         )
+
+    # La séance demandée doit correspondre à une date réellement programmée pour ce
+    # créneau (garde-fou : on n'enregistre jamais une réservation sur une date qui
+    # n'existe pas dans l'onglet Créneaux). Ignoré pour un créneau récurrent sans date.
+    if creneau.date:
+        dt_programme = creneau_datetime(creneau)
+        if dt_programme is None or dt_programme != date_seance:
+            raise BookingError(
+                "Cette séance n'existe pas à la date demandée. Merci de refaire votre choix."
+            )
 
     # Créneau plein
     if creneau.places_prises >= creneau.capacite:
@@ -209,7 +275,7 @@ def valider_reservation(
         raise BookingError("Impossible de réserver une séance passée.")
 
     if credit.formule in DEBIT_A_LACHAT:
-        _valider_essai_unite(credit, reservations_eleve)
+        _valider_essai_unite(credit)
     else:
         _valider_carte(credit, maintenant)
 
@@ -250,15 +316,13 @@ def _valider_abo(
         )
 
 
-def _valider_essai_unite(credit: Credit, reservations_eleve: list[Reservation]) -> None:
+def _valider_essai_unite(credit: Credit) -> None:
+    # ESSAI/UNITE/STAGE : une seule séance, suivie via credits_restants (1 à l'achat,
+    # décrémenté à la réservation, jamais recrédité — cf. JAMAIS_RECREDITE).
+    # On ne se base PAS sur l'existence d'autres réservations : une réservation faite
+    # avec une autre formule ne doit pas bloquer l'essai.
     if credit.credits_restants <= 0:
         raise BookingError(f"Crédit '{credit.formule}' déjà utilisé.")
-    # Vérifie qu'aucune réservation confirmée n'existe déjà pour ce crédit
-    # (1 résa max, jamais recrédité). L'appelant doit passer les réservations
-    # liées à ce crédit précis.
-    deja_reserve = any(r.statut == "confirmé" for r in reservations_eleve)
-    if deja_reserve:
-        raise BookingError(f"Formule '{credit.formule}' : une seule réservation possible.")
 
 
 def _valider_carte(credit: Credit, maintenant: datetime) -> None:

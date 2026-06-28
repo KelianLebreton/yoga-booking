@@ -14,6 +14,7 @@ from app.booking_logic import (
     TypeCours,
     _ajouter_mois,
     _fin_saison_abo,
+    creneau_datetime,
     credits_a_restituer,
     credits_apres_achat,
     parse_product_name,
@@ -53,12 +54,16 @@ def make_creneau(
     type_cours: TypeCours = TypeCours.VINYASA,
     capacite: int = 15,
     places_prises: int = 0,
+    date: str = "",
+    heure: str = "",
 ) -> Creneau:
     return Creneau(
         id_creneau="cr-001",
         type_cours=type_cours,
         capacite=capacite,
         places_prises=places_prises,
+        date=date,
+        heure=heure,
     )
 
 
@@ -119,14 +124,15 @@ class TestParseProductName:
 # ---------------------------------------------------------------------------
 
 class TestCreditsApresAchat:
-    def test_essai_zero_credits(self):
+    def test_essai_un_credit(self):
+        # ESSAI = une séance à réserver, sans expiration
         credits, exp = credits_apres_achat(Formule.ESSAI, date(2025, 10, 1))
-        assert credits == 0
+        assert credits == 1
         assert exp is None
 
-    def test_unite_zero_credits(self):
+    def test_unite_un_credit(self):
         credits, exp = credits_apres_achat(Formule.UNITE, date(2025, 10, 1))
-        assert credits == 0
+        assert credits == 1
 
     def test_c5_credits_et_expiration_3_mois(self):
         credits, exp = credits_apres_achat(Formule.C5, date(2025, 10, 1))
@@ -220,28 +226,27 @@ class TestValiderReservationEssaiUnite:
         with pytest.raises(BookingError, match="déjà utilisé"):
             valider_reservation(credit, make_creneau(), SEANCE_FUTURE, NOW, [])
 
-    def test_essai_deja_une_reservation(self):
+    def test_essai_autre_reservation_ne_bloque_pas(self):
+        """Une réservation faite avec une autre formule ne bloque pas l'essai
+        (l'unicité est garantie par credits_restants, pas par les réservations)."""
         credit = make_credit(formule=Formule.ESSAI, credits_restants=1)
-        with pytest.raises(BookingError, match="une seule"):
-            valider_reservation(
-                credit, make_creneau(), SEANCE_FUTURE, NOW,
-                [make_reservation()]
-            )
+        valider_reservation(
+            credit, make_creneau(), SEANCE_FUTURE, NOW, [make_reservation()]
+        )
 
-    def test_unite_deja_reserve(self):
+    def test_unite_autre_reservation_ne_bloque_pas(self):
         credit = make_credit(formule=Formule.UNITE, credits_restants=1)
-        with pytest.raises(BookingError, match="une seule"):
-            valider_reservation(
-                credit, make_creneau(), SEANCE_FUTURE, NOW,
-                [make_reservation()]
-            )
+        valider_reservation(
+            credit, make_creneau(), SEANCE_FUTURE, NOW, [make_reservation()]
+        )
 
-    def test_reservation_annulee_ne_bloque_pas(self):
-        """Une réservation annulée ne doit pas bloquer une nouvelle résa ESSAI."""
-        credit = make_credit(formule=Formule.ESSAI, credits_restants=1)
-        # Seule une résa confirmée bloque
-        resa_annulee = make_reservation(statut="annulé_à_temps")
-        valider_reservation(credit, make_creneau(), SEANCE_FUTURE, NOW, [resa_annulee])
+    def test_essai_credit_epuise_bloque(self):
+        """Après usage, credits_restants=0 → l'essai ne peut plus être réservé."""
+        credit = make_credit(formule=Formule.ESSAI, credits_restants=0)
+        with pytest.raises(BookingError, match="déjà utilisé"):
+            valider_reservation(
+                credit, make_creneau(), SEANCE_FUTURE, NOW, [make_reservation()]
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -338,3 +343,55 @@ class TestCreditsARestituer:
 
     def test_abo_zero(self):
         assert credits_a_restituer(Formule.ABO) == 0
+
+
+# ---------------------------------------------------------------------------
+# creneau_datetime
+# ---------------------------------------------------------------------------
+
+class TestCreneauDatetime:
+    def test_format_francais(self):
+        c = make_creneau(date="17/10/2025", heure="10:00:00")
+        assert creneau_datetime(c) == datetime(2025, 10, 17, 10, 0)
+
+    def test_heure_sans_secondes(self):
+        c = make_creneau(date="17/10/2025", heure="10:00")
+        assert creneau_datetime(c) == datetime(2025, 10, 17, 10, 0)
+
+    def test_format_iso(self):
+        c = make_creneau(date="2025-10-17", heure="10:00:00")
+        assert creneau_datetime(c) == datetime(2025, 10, 17, 10, 0)
+
+    def test_sans_date_retourne_none(self):
+        assert creneau_datetime(make_creneau()) is None
+
+    def test_date_illisible_retourne_none(self):
+        assert creneau_datetime(make_creneau(date="pas une date", heure="10:00")) is None
+
+
+# ---------------------------------------------------------------------------
+# valider_reservation — garde-fou date programmée (séance existe dans Créneaux)
+# ---------------------------------------------------------------------------
+
+class TestValiderReservationDateProgrammee:
+    def test_date_correspond_ok(self):
+        # SEANCE_FUTURE = 17/10/2025 10:00
+        creneau = make_creneau(date="17/10/2025", heure="10:00:00")
+        valider_reservation(make_credit(), creneau, SEANCE_FUTURE, NOW, [])
+
+    def test_date_ne_correspond_pas(self):
+        # Le créneau est programmé le 17/10 mais on tente de réserver un autre jour
+        creneau = make_creneau(date="17/10/2025", heure="10:00:00")
+        mauvaise_date = datetime(2025, 10, 18, 10, 0)
+        with pytest.raises(BookingError, match="n'existe pas"):
+            valider_reservation(make_credit(), creneau, mauvaise_date, NOW, [])
+
+    def test_heure_ne_correspond_pas(self):
+        creneau = make_creneau(date="17/10/2025", heure="10:00:00")
+        mauvaise_heure = datetime(2025, 10, 17, 18, 0)
+        with pytest.raises(BookingError, match="n'existe pas"):
+            valider_reservation(make_credit(), creneau, mauvaise_heure, NOW, [])
+
+    def test_creneau_sans_date_pas_de_controle(self):
+        # Créneau récurrent (date vide) : le garde-fou est ignoré, résa valide
+        valider_reservation(make_credit(), make_creneau(), SEANCE_FUTURE, NOW, [])

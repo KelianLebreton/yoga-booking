@@ -5,6 +5,7 @@ Démarrage : uvicorn main:app --reload  (depuis le répertoire app/)
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -14,14 +15,20 @@ from dotenv import load_dotenv
 load_dotenv()
 from typing import Annotated
 
+from dataclasses import replace
+
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from auth import get_email_from_token, lien_espace, creer_token_eleve
 from booking_logic import (
     BookingError,
     Formule,
+    TypeCours,
+    credit_compatible_avec_creneau,
+    creneau_datetime,
     credits_a_restituer,
     peut_annuler_en_self_service,
     valider_annulation,
@@ -34,6 +41,7 @@ from calendar_client import get_calendar_client
 
 app = FastAPI(title="Yoga Booking")
 app.include_router(mollie_router)
+app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 
 templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
 
@@ -67,14 +75,54 @@ async def espace(request: Request, email: EmailDep):
     # Trier par date de séance croissante
     resas_enrichies.sort(key=lambda x: x["resa"].date_seance)
 
+    # Séances disponibles, groupées par type de cours : futures et non complètes.
+    # Chaque entrée porte sa date (YYYY-MM-DD) pour être filtrée côté client par
+    # le jour choisi dans le calendrier ; le label n'affiche que heure + lieu + places.
+    counts = sheets.count_reservations_par_session()
+    sessions_par_type: dict[str, list[dict]] = {}
+    for c in creneaux:
+        dt = creneau_datetime(c)
+        if dt is None or dt <= maintenant:
+            continue
+        iso = dt.strftime("%Y-%m-%dT%H:%M")
+        restantes = c.capacite - counts.get((c.id_creneau, iso), 0)
+        if restantes <= 0:
+            continue
+        s = "s" if restantes > 1 else ""
+        label = dt.strftime("%H:%M")
+        if c.lieu:
+            label += f" — {c.lieu}"
+        label += f" ({restantes} place{s} restante{s})"
+        sessions_par_type.setdefault(c.type_cours.value, []).append({
+            "value": f"{c.id_creneau}|{iso}",
+            "date": dt.strftime("%Y-%m-%d"),
+            "heure": dt.strftime("%H:%M"),
+            "label": label,
+        })
+    for liste in sessions_par_type.values():
+        liste.sort(key=lambda x: (x["date"], x["heure"]))
+
+    # Pour chaque crédit actif, les types de cours réservables (compatibilité +
+    # disponibilité). Clé = index dans `credits` (= valeur du <select> Formule).
+    types_par_credit: dict[int, list[str]] = {}
+    for i, c in enumerate(credits):
+        if c.statut != "actif":
+            continue
+        types_par_credit[i] = sorted(
+            t for t in sessions_par_type
+            if credit_compatible_avec_creneau(c.type_cours, TypeCours(t))
+        )
+
     token = request.query_params.get("token", "")
     return templates.TemplateResponse(request, "espace.html", {
         "eleve": eleve,
+        "nom": eleve["nom"],
         "email": email,
         "credits": credits,
         "resas": resas_enrichies,
-        "creneaux": creneaux,
-        "maintenant": maintenant,
+        "sessions_par_type": json.dumps(sessions_par_type),
+        "types_par_credit": json.dumps(types_par_credit),
+        "today": maintenant.strftime("%Y-%m-%d"),
         "token": token,
     })
 
@@ -87,8 +135,7 @@ async def espace(request: Request, email: EmailDep):
 async def reserver(
     request: Request,
     email: EmailDep,
-    id_creneau: str = Form(...),
-    date_seance: str = Form(...),   # format ISO : "2025-10-20T09:00"
+    session: str = Form(...),   # "id_creneau|YYYY-MM-DDTHH:MM"
     id_credit_index: int = Form(...),  # index dans la liste des crédits de l'élève
     token: str = Form(...),
 ):
@@ -99,30 +146,63 @@ async def reserver(
         raise HTTPException(status_code=400, detail="Crédit sélectionné invalide.")
     credit = credits_eleve[id_credit_index]
 
-    creneau = sheets.get_creneau(id_creneau)
-    if not creneau:
-        raise HTTPException(status_code=404, detail="Créneau introuvable.")
+    id_creneau, _, date_seance = session.partition("|")
+    if not id_creneau or not date_seance:
+        return templates.TemplateResponse(request, "erreur.html", {
+            "message": "Séance invalide. Merci de refaire votre sélection.",
+            "token": token,
+        }, status_code=400)
 
     try:
         date_seance_dt = datetime.fromisoformat(date_seance)
     except ValueError:
-        raise HTTPException(status_code=400, detail="Format de date invalide.")
+        return templates.TemplateResponse(request, "erreur.html", {
+            "message": "Date invalide. Merci de refaire votre sélection.",
+            "token": token,
+        }, status_code=400)
+
+    # Charge les créneaux une seule fois : sert à valider la séance ET à connaître
+    # le type de cours de chaque réservation existante.
+    creneaux = sheets.get_creneaux()
+
+    # La séance doit correspondre à une ligne réellement programmée (id + date + heure)
+    creneau = next(
+        (c for c in creneaux
+         if c.id_creneau == id_creneau and creneau_datetime(c) == date_seance_dt),
+        None,
+    )
+    if not creneau:
+        return templates.TemplateResponse(request, "erreur.html", {
+            "message": "Ce créneau n'existe pas à cette date. Merci de refaire votre réservation.",
+            "token": token,
+        }, status_code=400)
 
     maintenant = datetime.now()
-    reservations_eleve = sheets.get_reservations_eleve(email, statut="confirmé")
+
+    # Réservations confirmées portant sur un type de cours couvert par ce crédit.
+    # Utile pour la règle ABO (1 réservation/semaine/type) : on ne compare qu'avec
+    # les réservations du même type. (ESSAI/UNITE s'appuient sur credits_restants.)
+    types_par_id = {c.id_creneau: c.type_cours for c in creneaux}
+    reservations_pertinentes = [
+        r for r in sheets.get_reservations_eleve(email, statut="confirmé")
+        if r.id_creneau in types_par_id
+        and credit_compatible_avec_creneau(credit.type_cours, types_par_id[r.id_creneau])
+    ]
+
+    places_ce_jour = sheets.count_reservations_date(id_creneau, date_seance_dt)
+    creneau_ce_jour = replace(creneau, places_prises=places_ce_jour)
 
     try:
-        valider_reservation(credit, creneau, date_seance_dt, maintenant, reservations_eleve)
+        valider_reservation(credit, creneau_ce_jour, date_seance_dt, maintenant, reservations_pertinentes)
     except BookingError as e:
         return templates.TemplateResponse(request, "erreur.html", {
             "message": str(e),
             "token": token,
         }, status_code=400)
 
-    # Persistance atomique : réservation + débit crédit + place
+    # Persistance : réservation + débit crédit
     id_resa = sheets.add_reservation(email, id_creneau, date_seance_dt)
-    sheets.incrementer_places_prises(id_creneau)
-    creneau_maj = sheets.get_creneau(id_creneau)  # relit pour avoir places_prises à jour
+    creneau_maj = sheets.get_creneau(id_creneau)
     try:
         get_calendar_client().sync_creneau(creneau_maj, sheets)
     except Exception as e:
@@ -175,7 +255,6 @@ async def annuler(
         }, status_code=400)
 
     sheets.update_statut_reservation(id_resa, "annulé_à_temps")
-    sheets.decrementer_places_prises(reservation.id_creneau)
     creneau_maj = sheets.get_creneau(reservation.id_creneau)
     try:
         get_calendar_client().sync_creneau(creneau_maj, sheets)
