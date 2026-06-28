@@ -45,6 +45,14 @@ async def webhook_mollie(
     """
     body = await request.body()
 
+    # --- LOG TEMPORAIRE DE DIAGNOSTIC (à retirer une fois le format identifié) ---
+    logger.info(
+        "Webhook Mollie reçu — content-type=%r — body=%r",
+        request.headers.get("content-type"),
+        body.decode("utf-8", "replace")[:2000],
+    )
+    # ---------------------------------------------------------------------------
+
     _verifier_signature(body, x_mollie_signature)
 
     form = await request.form()
