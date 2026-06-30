@@ -44,6 +44,7 @@ _TAB_CREDITS = "Crédits"
 _TAB_CRENEAUX = "Créneaux"
 _TAB_RESERVATIONS = "Réservations"
 _TAB_SIGNALEMENTS = "Signalements"
+_TAB_PAIEMENTS = "PaiementsTraites"
 
 _DATE_FMT = "%Y-%m-%d"
 _DATETIME_FMT = "%Y-%m-%dT%H:%M"
@@ -338,6 +339,39 @@ class SheetsClient:
             id_creneau,
             self._fmt_datetime(datetime.now()),
             motif,
+        ])
+
+    # ------------------------------------------------------------------
+    # Paiements traités (déduplication de la réconciliation Mollie)
+    # ------------------------------------------------------------------
+
+    _PAIEMENTS_HEADER = ["payment_id", "order_id", "email", "produit", "horodatage"]
+
+    def _ensure_tab(self, name: str, header: list[str]) -> gspread.Worksheet:
+        """Retourne l'onglet, en le créant (avec en-tête) s'il n'existe pas."""
+        try:
+            return self._spreadsheet.worksheet(name)
+        except gspread.WorksheetNotFound:
+            ws = self._spreadsheet.add_worksheet(title=name, rows=200, cols=len(header))
+            ws.append_row(header)
+            return ws
+
+    def paiements_traites_ids(self) -> set[str]:
+        """Ensemble des id de paiements Mollie déjà traités (crédités)."""
+        ws = self._ensure_tab(_TAB_PAIEMENTS, self._PAIEMENTS_HEADER)
+        return {str(r["payment_id"]) for r in ws.get_all_records() if r.get("payment_id")}
+
+    def marquer_paiement_traite(
+        self, payment_id: str, order_id: str, email: str, produit: str
+    ) -> None:
+        """Enregistre un paiement comme traité pour ne jamais le recréditer."""
+        ws = self._ensure_tab(_TAB_PAIEMENTS, self._PAIEMENTS_HEADER)
+        ws.append_row([
+            payment_id,
+            order_id,
+            email,
+            produit,
+            self._fmt_datetime(datetime.now()),
         ])
 
 
