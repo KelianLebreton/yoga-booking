@@ -172,6 +172,8 @@ _CATALOGUE: dict[str, tuple[TypeCours, Formule]] = {
     "yoga aérien carte de 5": (TypeCours.AERIEN, Formule.C5),
     "ashtanga & flow yoga carte de 10": (TypeCours.ASHTANGA_VINYASA, Formule.C10),
     "yoga aérien carte de 10": (TypeCours.AERIEN, Formule.C10),
+    "ashtanga & flow yoga carte de 20": (TypeCours.ASHTANGA_VINYASA, Formule.C20),
+    "yoga aérien carte de 20": (TypeCours.AERIEN, Formule.C20),
 }
 
 
