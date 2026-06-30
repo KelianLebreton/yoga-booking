@@ -108,6 +108,24 @@ async def debug_mollie_payments(request: Request) -> dict:
             list((p.get("_links") or {}).keys()),
         )
 
+    # Inspecter l'order associé aux paiements payés (email + lignes produit) — 3 max
+    fetched = 0
+    for p in payments:
+        if p.get("status") != "paid" or not p.get("orderId") or fetched >= 3:
+            continue
+        fetched += 1
+        order = await _fetch_order(p["orderId"])
+        billing = order.get("billingAddress", {}) or {}
+        lines = order.get("lines") or (order.get("_embedded", {}) or {}).get("lines") or []
+        logger.warning(
+            "Mollie order — id=%s status=%s email=%r prenom=%r nom=%r lignes=%r",
+            order.get("id"), order.get("status"),
+            billing.get("email"), billing.get("givenName"), billing.get("familyName"),
+            [{"name": l.get("name"), "sku": l.get("sku"),
+              "metadata": l.get("metadata"), "type": l.get("type"),
+              "qty": l.get("quantity")} for l in lines],
+        )
+
     return {
         "http_status": resp.status_code,
         "count": len(payments),
