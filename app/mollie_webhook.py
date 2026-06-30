@@ -127,6 +127,7 @@ async def reconcile_mollie(request: Request) -> dict:
     if not admin_key or request.query_params.get("key") != admin_key:
         raise HTTPException(status_code=403, detail="Clé invalide.")
     dry_run = request.query_params.get("dry_run") == "1"
+    only_pid = request.query_params.get("payment_id")  # optionnel : ne traiter qu'un paiement
 
     api_key = os.environ["MOLLIE_API_KEY"].strip()
     async with httpx.AsyncClient() as client:
@@ -145,6 +146,8 @@ async def reconcile_mollie(request: Request) -> dict:
         if p.get("status") != "paid":
             continue
         pid = p.get("id", "")
+        if only_pid and pid != only_pid:
+            continue
         if pid in deja:
             resultats.append({"payment_id": pid, "statut": "déjà_traité"})
             continue
