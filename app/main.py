@@ -268,12 +268,17 @@ async def annuler(
     except Exception as e:
         logger.warning("Sync Calendar échoué (non bloquant) : %s", e)
 
-    # Recréditer si la formule le permet
+    # Recréditer si la formule le permet. On cherche un crédit COMPATIBLE avec le
+    # créneau (même logique qu'à la réservation : les types combinés couvrent
+    # plusieurs cours), pas une égalité stricte de type.
     credits_eleve = sheets.get_credits_eleve(email)
     creneau = sheets.get_creneau(reservation.id_creneau)
     if creneau:
         for credit in credits_eleve:
-            if credit.type_cours == creneau.type_cours and credits_a_restituer(credit.formule) > 0:
+            if (
+                credit_compatible_avec_creneau(credit.type_cours, creneau.type_cours)
+                and credits_a_restituer(credit.formule) > 0
+            ):
                 sheets.incrementer_credit(email, credit.type_cours, credit.formule)
                 break
 
