@@ -209,9 +209,8 @@ async def reserver(
 
     # Persistance : réservation + débit crédit
     id_resa = sheets.add_reservation(email, id_creneau, date_seance_dt)
-    creneau_maj = sheets.get_creneau(id_creneau)
     try:
-        get_calendar_client().sync_creneau(creneau_maj, sheets)
+        get_calendar_client().sync_session(creneau, date_seance_dt, sheets)
     except Exception as e:
         logger.warning("Sync Calendar échoué (non bloquant) : %s", e)
 
@@ -262,9 +261,10 @@ async def annuler(
         }, status_code=400)
 
     sheets.update_statut_reservation(id_resa, "annulé_à_temps")
-    creneau_maj = sheets.get_creneau(reservation.id_creneau)
+    creneau_annule = sheets.get_creneau(reservation.id_creneau)
     try:
-        get_calendar_client().sync_creneau(creneau_maj, sheets)
+        if creneau_annule:
+            get_calendar_client().sync_session(creneau_annule, reservation.date_seance, sheets)
     except Exception as e:
         logger.warning("Sync Calendar échoué (non bloquant) : %s", e)
 

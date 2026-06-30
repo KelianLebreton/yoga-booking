@@ -1,15 +1,16 @@
 """
 Synchronisation Google Calendar — vue lecture seule pour la professeure.
 
-Un événement récurrent par créneau, mis à jour avec la liste des participants
-à chaque appel à sync_creneau() ou sync_tous_les_creneaux().
+Modèle daté : **un événement par séance réservée** (id_créneau + date précise),
+mis à jour avec la liste des participants confirmés de cette séance. Quand une
+séance n'a plus aucun participant, son événement est supprimé.
 
 La professeure ne doit JAMAIS modifier Calendar manuellement : tout sera
 écrasé à la prochaine synchronisation.
 
 Variables d'environnement requises :
   GOOGLE_SERVICE_ACCOUNT_JSON / GOOGLE_SERVICE_ACCOUNT_INFO  (même compte que Sheets)
-  GOOGLE_CALENDAR_ID  – ID du calendrier à synchroniser (ex: abc123@group.calendar.google.com)
+  GOOGLE_CALENDAR_ID  – ID du calendrier à synchroniser
 """
 
 from __future__ import annotations
@@ -23,38 +24,18 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from booking_logic import Creneau, Reservation, TypeCours
-from sheets_client import SheetsClient, get_sheets_client
+from booking_logic import Creneau, Reservation
+from sheets_client import SheetsClient
 
 logger = logging.getLogger(__name__)
 
-_SCOPES = [
-    "https://www.googleapis.com/auth/calendar",
-]
+_SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
-# Champ utilisé pour retrouver nos événements : extendedProperties.private.id_creneau
-_PROP_KEY = "id_creneau"
+# Clé d'identification de NOS événements : extendedProperties.private.session
+_PROP_KEY = "session"
 
-_JOURS_FR = {
-    "lundi": 0, "mardi": 1, "mercredi": 2, "jeudi": 3,
-    "vendredi": 4, "samedi": 5, "dimanche": 6,
-}
+_DUREE_SEANCE = timedelta(hours=1, minutes=30)
 
-
-def _prochaine_occurrence(jour_semaine: str, heure: str) -> datetime:
-    """Retourne la prochaine occurrence (future) du jour et de l'heure donnés."""
-    now = datetime.now()
-    cible = _JOURS_FR.get(jour_semaine.lower(), 0)
-    h, m = (int(x) for x in heure.split(":")) if ":" in heure else (9, 0)
-    jours = (cible - now.weekday()) % 7
-    if jours == 0 and now.hour >= h:
-        jours = 7  # déjà passé aujourd'hui → semaine prochaine
-    return now.replace(hour=h, minute=m, second=0, microsecond=0) + timedelta(days=jours)
-
-
-# ---------------------------------------------------------------------------
-# Client Calendar
-# ---------------------------------------------------------------------------
 
 class CalendarClient:
     def __init__(self, calendar_id: str, credentials: Credentials) -> None:
@@ -65,55 +46,83 @@ class CalendarClient:
     # API publique
     # ------------------------------------------------------------------
 
-    def sync_tous_les_creneaux(self, sheets: SheetsClient) -> None:
+    def sync_session(self, creneau: Creneau, date_seance: datetime, sheets: SheetsClient) -> None:
         """
-        Synchronise tous les créneaux actifs depuis Sheets vers Calendar.
-        À appeler manuellement ou via un cron après chaque réservation/annulation
-        si on veut garder Calendar à jour en temps réel.
+        Met à jour (ou crée/supprime) l'événement Calendar d'une séance datée.
+        - participants présents  → crée/met à jour l'événement à la date de la séance
+        - plus aucun participant → supprime l'événement s'il existe
         """
-        creneaux = sheets.get_creneaux()
-        for creneau in creneaux:
-            try:
-                self.sync_creneau(creneau, sheets)
-            except Exception as exc:
-                logger.error("Erreur sync créneau %s : %s", creneau.id_creneau, exc)
-
-    def sync_creneau(self, creneau: Creneau, sheets: SheetsClient) -> None:
-        """
-        Met à jour (ou crée) l'événement Calendar pour un créneau donné.
-        La description de l'événement contient la liste des participants confirmés.
-        """
-        resas = self._get_resas_creneau(creneau.id_creneau, sheets)
+        resas = self._get_resas_session(creneau.id_creneau, date_seance, sheets)
         participants = self._liste_participants(resas, sheets)
+        key = self._session_key(creneau.id_creneau, date_seance)
+        existing_id = self._find_event(key)
 
-        event_body = self._build_event(creneau, participants)
-        existing_event_id = self._find_event(creneau.id_creneau)
+        if not participants:
+            if existing_id:
+                self._service.events().delete(
+                    calendarId=self._calendar_id, eventId=existing_id
+                ).execute()
+                logger.info("Événement supprimé (séance vide) : %s", key)
+            return
 
-        if existing_event_id:
+        body = self._build_event(creneau, date_seance, participants)
+        if existing_id:
             self._service.events().update(
-                calendarId=self._calendar_id,
-                eventId=existing_event_id,
-                body=event_body,
+                calendarId=self._calendar_id, eventId=existing_id, body=body
             ).execute()
-            logger.info("Événement mis à jour : créneau %s", creneau.id_creneau)
+            logger.info("Événement mis à jour : %s", key)
         else:
             self._service.events().insert(
-                calendarId=self._calendar_id,
-                body=event_body,
+                calendarId=self._calendar_id, body=body
             ).execute()
-            logger.info("Événement créé : créneau %s", creneau.id_creneau)
+            logger.info("Événement créé : %s", key)
+
+    def sync_toutes_les_sessions(self, sheets: SheetsClient) -> None:
+        """
+        Reconstruit toutes les séances ayant au moins une réservation confirmée.
+        Utile pour une resynchronisation manuelle complète.
+        """
+        creneaux = {c.id_creneau: c for c in sheets.get_creneaux()}
+        ws = sheets._tab("Réservations")
+        vues: set[tuple[str, str]] = set()
+        for row in ws.get_all_records():
+            if row["statut"] != "confirmé":
+                continue
+            idc = str(row["id_créneau"])
+            date_str = str(row["date_séance"])
+            if (idc, date_str) in vues:
+                continue
+            vues.add((idc, date_str))
+            creneau = creneaux.get(idc)
+            if not creneau:
+                continue
+            try:
+                date_seance = datetime.strptime(date_str, "%Y-%m-%dT%H:%M")
+                self.sync_session(creneau, date_seance, sheets)
+            except Exception as exc:
+                logger.error("Erreur sync séance %s %s : %s", idc, date_str, exc)
 
     # ------------------------------------------------------------------
     # Helpers internes
     # ------------------------------------------------------------------
 
-    def _get_resas_creneau(self, id_creneau: str, sheets: SheetsClient) -> list[Reservation]:
-        """Retourne toutes les réservations confirmées pour un créneau donné."""
+    @staticmethod
+    def _session_key(id_creneau: str, date_seance: datetime) -> str:
+        return f"{id_creneau}|{date_seance.strftime('%Y-%m-%dT%H:%M')}"
+
+    def _get_resas_session(
+        self, id_creneau: str, date_seance: datetime, sheets: SheetsClient
+    ) -> list[Reservation]:
+        """Réservations confirmées pour CETTE séance précise (id + date)."""
         ws = sheets._tab("Réservations")
-        rows = ws.get_all_records()
+        date_str = date_seance.strftime("%Y-%m-%dT%H:%M")
         resas = []
-        for row in rows:
-            if str(row["id_créneau"]) == id_creneau and row["statut"] == "confirmé":
+        for row in ws.get_all_records():
+            if (
+                str(row["id_créneau"]) == id_creneau
+                and str(row["date_séance"]) == date_str
+                and row["statut"] == "confirmé"
+            ):
                 resas.append(Reservation(
                     id_resa=str(row["id_résa"]),
                     email_eleve=row["email_élève"],
@@ -124,45 +133,45 @@ class CalendarClient:
         return resas
 
     def _liste_participants(self, resas: list[Reservation], sheets: SheetsClient) -> list[str]:
-        """Retourne la liste 'Prénom NOM (email)' des participants."""
+        """Liste 'Prénom NOM (email)' des participants de la séance."""
         participants = []
         for r in resas:
             eleve = sheets.get_eleve(r.email_eleve)
-            if eleve:
-                nom = eleve.get("nom", r.email_eleve)
-                participants.append(f"{nom} ({r.email_eleve}) — {r.date_seance.strftime('%d/%m à %H:%M')}")
-            else:
-                participants.append(f"{r.email_eleve} — {r.date_seance.strftime('%d/%m à %H:%M')}")
+            nom = eleve.get("nom", r.email_eleve) if eleve else r.email_eleve
+            participants.append(f"{nom} ({r.email_eleve})")
         return participants
 
-    def _build_event(self, creneau: Creneau, participants: list[str]) -> dict:
-        """Construit le corps d'un événement Google Calendar."""
-        start = _prochaine_occurrence(creneau.jour_semaine, creneau.heure)
-        end = start + timedelta(hours=1, minutes=30)
+    def _build_event(self, creneau: Creneau, date_seance: datetime, participants: list[str]) -> dict:
+        """Corps d'un événement Calendar pour une séance datée."""
+        start = date_seance
+        end = start + _DUREE_SEANCE
+        n = len(participants)
 
-        description_lines = [
-            f"Cours : {creneau.type_cours.value}",
-            f"Capacité : {creneau.places_prises}/{creneau.capacite} places",
+        lignes = [f"Cours : {creneau.type_cours.value}"]
+        if creneau.lieu:
+            lignes.append(f"Lieu : {creneau.lieu}")
+        lignes += [
+            f"Places : {n}/{creneau.capacite}",
             "",
-            f"Participants ({len(participants)}) :",
-        ] + (participants if participants else ["— Aucun participant —"])
+            f"Participants ({n}) :",
+        ] + participants
 
         return {
-            "summary": f"{creneau.type_cours.value} ({creneau.places_prises}/{creneau.capacite})",
-            "description": "\n".join(description_lines),
+            "summary": f"{creneau.type_cours.value} ({n}/{creneau.capacite})",
+            "description": "\n".join(lignes),
             "start": {"dateTime": start.isoformat(), "timeZone": "Europe/Paris"},
-            "end":   {"dateTime": end.isoformat(),   "timeZone": "Europe/Paris"},
+            "end": {"dateTime": end.isoformat(), "timeZone": "Europe/Paris"},
             "extendedProperties": {
-                "private": {_PROP_KEY: creneau.id_creneau}
+                "private": {_PROP_KEY: self._session_key(creneau.id_creneau, date_seance)}
             },
         }
 
-    def _find_event(self, id_creneau: str) -> str | None:
-        """Cherche un événement existant par id_creneau dans les propriétés privées."""
+    def _find_event(self, session_key: str) -> str | None:
+        """Cherche l'événement d'une séance par sa clé (id_créneau|date)."""
         try:
             result = self._service.events().list(
                 calendarId=self._calendar_id,
-                privateExtendedProperty=f"{_PROP_KEY}={id_creneau}",
+                privateExtendedProperty=f"{_PROP_KEY}={session_key}",
                 maxResults=1,
                 singleEvents=True,
             ).execute()
