@@ -1,48 +1,53 @@
 """
-Envoi d'emails transactionnels via SMTP (Brevo ou tout serveur SMTP).
+Envoi d'emails transactionnels via l'API HTTP de Brevo.
+
+On utilise l'API REST (HTTPS, port 443) et NON le SMTP : les hébergeurs comme
+Render bloquent les ports SMTP sortants (25/465/587). L'API HTTP passe.
 
 Variables d'environnement requises :
-  SMTP_HOST       – ex: smtp-relay.brevo.com
-  SMTP_PORT       – ex: 587
-  SMTP_USER       – identifiant SMTP
-  SMTP_PASSWORD   – mot de passe / clé API SMTP
-  EMAIL_FROM      – adresse expéditrice (ex: noreply@studio-yoga.fr)
-  BASE_URL        – URL publique de l'app (pour construire le lien espace)
+  BREVO_API_KEY    – clé API v3 Brevo (Brevo → SMTP & API → API Keys)
+  EMAIL_FROM       – adresse expéditrice vérifiée chez Brevo (ex: noreply@studio-yoga.fr)
+  EMAIL_FROM_NAME  – nom affiché de l'expéditeur (optionnel, défaut "Studio Yoga")
+  BASE_URL         – URL publique de l'app (pour construire le lien espace)
 """
 
 from __future__ import annotations
 
 import os
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+
+import httpx
 
 from auth import lien_espace
 
-
-def _smtp_connection() -> smtplib.SMTP:
-    host = os.environ["SMTP_HOST"]
-    port = int(os.environ.get("SMTP_PORT", "587"))
-    user = os.environ["SMTP_USER"]
-    password = os.environ["SMTP_PASSWORD"]
-
-    smtp = smtplib.SMTP(host, port)
-    smtp.starttls()
-    smtp.login(user, password)
-    return smtp
+_BREVO_URL = "https://api.brevo.com/v3/smtp/email"
 
 
-def _envoyer(to: str, subject: str, html: str, text: str) -> None:
-    from_addr = os.environ["EMAIL_FROM"]
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = from_addr
-    msg["To"] = to
-    msg.attach(MIMEText(text, "plain", "utf-8"))
-    msg.attach(MIMEText(html, "html", "utf-8"))
+async def _envoyer(to: str, subject: str, html: str, text: str) -> None:
+    """Envoie un email via l'API Brevo. Lève une exception si l'envoi échoue."""
+    api_key = os.environ["BREVO_API_KEY"].strip()
+    from_addr = os.environ["EMAIL_FROM"].strip()
+    from_name = os.environ.get("EMAIL_FROM_NAME", "Studio Yoga").strip()
 
-    with _smtp_connection() as smtp:
-        smtp.sendmail(from_addr, to, msg.as_string())
+    payload = {
+        "sender": {"email": from_addr, "name": from_name},
+        "to": [{"email": to}],
+        "subject": subject,
+        "htmlContent": html,
+        "textContent": text,
+    }
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            _BREVO_URL,
+            json=payload,
+            headers={
+                "api-key": api_key,
+                "accept": "application/json",
+                "content-type": "application/json",
+            },
+            timeout=15.0,
+        )
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"Brevo API {resp.status_code} : {resp.text[:300]}")
 
 
 async def envoyer_lien_espace(email: str, nom: str, token: str) -> None:
@@ -91,7 +96,7 @@ Le studio
 </body>
 </html>
 """
-    _envoyer(email, subject, html, text)
+    await _envoyer(email, subject, html, text)
 
 
 async def envoyer_confirmation_reservation(
@@ -143,4 +148,4 @@ Pour annuler (jusqu'à 24h avant) ou voir vos autres réservations :
 </body>
 </html>
 """
-    _envoyer(email, subject, html, text)
+    await _envoyer(email, subject, html, text)
