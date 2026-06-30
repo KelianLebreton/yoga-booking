@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -305,3 +306,22 @@ async def signaler(
     sheets.add_signalement(email=email, id_creneau=id_creneau, motif=motif)
 
     return RedirectResponse(url=f"/espace?token={token}&ok=signaler", status_code=303)
+
+
+# ---------------------------------------------------------------------------
+# Resynchronisation complète du calendrier Google (manuel / cron)
+# Reconstruit un événement par séance ayant une réservation confirmée.
+# ?key=<ADMIN_KEY>
+# ---------------------------------------------------------------------------
+
+@app.get("/tasks/sync-calendar")
+async def sync_calendar(request: Request):
+    admin_key = os.environ.get("ADMIN_KEY", "")
+    if not admin_key or request.query_params.get("key") != admin_key:
+        raise HTTPException(status_code=403, detail="Clé invalide.")
+    try:
+        get_calendar_client().sync_toutes_les_sessions(get_sheets_client())
+    except Exception as e:
+        logger.error("Sync calendrier complète échouée : %s", e)
+        raise HTTPException(status_code=500, detail=f"Erreur sync : {e}")
+    return {"detail": "calendrier synchronisé"}

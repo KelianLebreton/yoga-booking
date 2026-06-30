@@ -63,58 +63,6 @@ async def webhook_mollie(
 
 
 # ---------------------------------------------------------------------------
-# Diagnostic TEMPORAIRE : inspecter les derniers paiements + orders via l'API.
-# Protégé par ?key=<ADMIN_KEY>. À retirer une fois la solution stabilisée.
-# ---------------------------------------------------------------------------
-
-@router.get("/debug/mollie-payments")
-async def debug_mollie_payments(request: Request) -> dict:
-    import httpx
-
-    admin_key = os.environ.get("ADMIN_KEY", "")
-    if not admin_key or request.query_params.get("key") != admin_key:
-        raise HTTPException(status_code=403, detail="Clé invalide.")
-
-    api_key = os.environ["MOLLIE_API_KEY"].strip()
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            "https://api.mollie.com/v2/payments?limit=10",
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=15.0,
-        )
-    payments = (resp.json().get("_embedded", {}) or {}).get("payments", [])
-
-    for p in payments:
-        logger.warning(
-            "Mollie payment — id=%s mode=%s status=%s desc=%r orderId=%s amount=%r",
-            p.get("id"), p.get("mode"), p.get("status"), p.get("description"),
-            p.get("orderId"), p.get("amount"),
-        )
-
-    fetched = 0
-    for p in payments:
-        if p.get("status") != "paid" or not p.get("orderId") or fetched >= 3:
-            continue
-        fetched += 1
-        order = await _fetch_order(p["orderId"])
-        billing = order.get("billingAddress", {}) or {}
-        lines = order.get("lines") or (order.get("_embedded", {}) or {}).get("lines") or []
-        logger.warning(
-            "Mollie order — id=%s status=%s email=%r prenom=%r nom=%r lignes=%r",
-            order.get("id"), order.get("status"),
-            billing.get("email"), billing.get("givenName"), billing.get("familyName"),
-            [{"name": l.get("name"), "sku": l.get("sku")} for l in lines],
-        )
-
-    return {
-        "http_status": resp.status_code,
-        "count": len(payments),
-        "modes": [p.get("mode") for p in payments],
-        "statuses": [p.get("status") for p in payments],
-    }
-
-
-# ---------------------------------------------------------------------------
 # Réconciliation Mollie : crédite les paiements payés non encore traités.
 # ?key=<ADMIN_KEY>  &  ?dry_run=1 pour un aperçu sans rien écrire.
 # ---------------------------------------------------------------------------
