@@ -81,8 +81,10 @@ DUREE_VALIDITE_MOIS: dict[Formule, Optional[int]] = {
 # Formules dont le crédit est débité à l'achat (non à la réservation)
 DEBIT_A_LACHAT: frozenset[Formule] = frozenset({Formule.ESSAI, Formule.UNITE, Formule.STAGE})
 
-# Formules jamais recrédités en cas d'annulation
-JAMAIS_RECREDITE: frozenset[Formule] = frozenset({Formule.ESSAI, Formule.UNITE, Formule.STAGE})
+# Formules jamais recréditées en cas d'annulation, même à temps.
+# Vide actuellement : aucun produit n'est non-restituable en pratique. Le mécanisme
+# reste en place — ajouter une Formule ici la rendra non-restituable à l'annulation.
+JAMAIS_RECREDITE: frozenset[Formule] = frozenset()
 
 DELAI_ANNULATION = timedelta(hours=24)
 
@@ -190,8 +192,8 @@ def parse_product_name(reference: str) -> tuple[TypeCours, Formule]:
 def credits_apres_achat(formule: Formule, date_achat: date) -> tuple[int, Optional[date]]:
     """
     Retourne (credits_initiaux, date_expiration) pour une formule achetée.
-    ESSAI/UNITE/STAGE : une séance à réserver (non remboursable, cf. JAMAIS_RECREDITE),
-    sans expiration. Le crédit est décrémenté lors de la réservation.
+    ESSAI/UNITE/STAGE : une séance à réserver, sans expiration. Le crédit est
+    décrémenté lors de la réservation (et restitué en cas d'annulation à temps).
     ABO : 0 crédits (pas de décompte), expiration fin juin de la saison courante.
     """
     if formule in DEBIT_A_LACHAT:
@@ -318,7 +320,7 @@ def _valider_abo(
 
 def _valider_essai_unite(credit: Credit) -> None:
     # ESSAI/UNITE/STAGE : une seule séance, suivie via credits_restants (1 à l'achat,
-    # décrémenté à la réservation, jamais recrédité — cf. JAMAIS_RECREDITE).
+    # décrémenté à la réservation ; restitué si annulation à temps).
     # On ne se base PAS sur l'existence d'autres réservations : une réservation faite
     # avec une autre formule ne doit pas bloquer l'essai.
     if credit.credits_restants <= 0:

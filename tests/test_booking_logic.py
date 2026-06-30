@@ -335,13 +335,18 @@ class TestCreditsARestituer:
         assert credits_a_restituer(Formule.C10) == 1
         assert credits_a_restituer(Formule.C20) == 1
 
-    def test_essai_jamais_restitue(self):
-        assert credits_a_restituer(Formule.ESSAI) == 0
+    def test_essai_restitue_1(self):
+        # JAMAIS_RECREDITE est vide : l'essai est restitué si annulation à temps
+        assert credits_a_restituer(Formule.ESSAI) == 1
 
-    def test_unite_jamais_restitue(self):
-        assert credits_a_restituer(Formule.UNITE) == 0
+    def test_unite_restitue_1(self):
+        assert credits_a_restituer(Formule.UNITE) == 1
+
+    def test_stage_restitue_1(self):
+        assert credits_a_restituer(Formule.STAGE) == 1
 
     def test_abo_zero(self):
+        # ABO ne décompte pas de crédit : rien à restituer
         assert credits_a_restituer(Formule.ABO) == 0
 
 
