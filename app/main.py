@@ -55,11 +55,16 @@ EmailDep = Annotated[str, Depends(get_email_from_token)]
 
 @app.get("/espace", response_class=HTMLResponse)
 async def espace(request: Request, email: EmailDep):
+    logger.warning("espace: début pour %s", email)
     sheets = get_sheets_client()
     eleve = sheets.get_eleve(email)
+    logger.warning("espace: get_eleve OK")
     credits = sheets.get_credits_eleve(email)
+    logger.warning("espace: get_credits OK (%d)", len(credits))
     reservations = sheets.get_reservations_eleve(email, statut="confirmé")
+    logger.warning("espace: get_reservations OK (%d)", len(reservations))
     creneaux = sheets.get_creneaux()
+    logger.warning("espace: get_creneaux OK (%d)", len(creneaux))
     creneaux_par_id = {c.id_creneau: c for c in creneaux}
 
     maintenant = datetime.now()
@@ -79,6 +84,7 @@ async def espace(request: Request, email: EmailDep):
     # Chaque entrée porte sa date (YYYY-MM-DD) pour être filtrée côté client par
     # le jour choisi dans le calendrier ; le label n'affiche que heure + lieu + places.
     counts = sheets.count_reservations_par_session()
+    logger.warning("espace: count_reservations_par_session OK")
     sessions_par_type: dict[str, list[dict]] = {}
     for c in creneaux:
         dt = creneau_datetime(c)
@@ -113,6 +119,7 @@ async def espace(request: Request, email: EmailDep):
             if credit_compatible_avec_creneau(c.type_cours, TypeCours(t))
         )
 
+    logger.warning("espace: sessions construites (%d types), rendu template", len(sessions_par_type))
     token = request.query_params.get("token", "")
     return templates.TemplateResponse(request, "espace.html", {
         "eleve": eleve,
