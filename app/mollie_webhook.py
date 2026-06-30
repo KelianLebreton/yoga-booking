@@ -1,13 +1,18 @@
 """
-Réception et traitement des webhooks Mollie.
+Crédit des achats Mollie.
 
-Flux : Mollie POST /webhook/mollie → on récupère le paiement via l'API Mollie
-→ on parse la référence produit → on crédite l'élève dans Sheets → on envoie
-le lien permanent par email.
+Webador crée des *orders* Mollie mais ne déclenche aucun webhook exploitable
+vers notre app. On procède donc par **réconciliation via l'API Mollie** :
+l'endpoint /tasks/reconcile-mollie interroge l'API, repère les paiements payés
+non encore traités, crédite l'élève dans Sheets et envoie le lien espace.
 
-Variable d'environnement requise :
-  MOLLIE_API_KEY        – clé Mollie (live_... ou test_...)
-  MOLLIE_WEBHOOK_SECRET – secret optionnel pour valider la signature (si configuré)
+Le endpoint /webhook/mollie reste présent (accuse réception du hook.ping de test)
+mais n'est plus la source de vérité.
+
+Variables d'environnement :
+  MOLLIE_API_KEY   – clé Mollie (live_... ou test_...)
+  ADMIN_KEY        – protège les endpoints /debug et /tasks (?key=...)
+  MOLLIE_WEBHOOK_SECRET – secret optionnel de signature (si configuré)
 """
 
 from __future__ import annotations
@@ -33,7 +38,7 @@ router = APIRouter()
 
 
 # ---------------------------------------------------------------------------
-# Route webhook
+# Webhook (conservé pour le hook.ping ; Webador n'envoie pas de vrai événement)
 # ---------------------------------------------------------------------------
 
 @router.post("/webhook/mollie", status_code=status.HTTP_200_OK)
@@ -41,45 +46,25 @@ async def webhook_mollie(
     request: Request,
     x_mollie_signature: str | None = Header(default=None),
 ) -> dict:
-    """
-    Mollie appelle cette URL après chaque changement de statut de paiement.
-    On ne traite que les paiements au statut "paid".
-    """
     body = await request.body()
-
-    # --- LOG TEMPORAIRE DE DIAGNOSTIC (à retirer une fois le format identifié) ---
-    logger.warning(
-        "Webhook Mollie reçu — headers=%r — body=%r",
-        dict(request.headers),
-        body.decode("utf-8", "replace")[:2000],
-    )
-    # ---------------------------------------------------------------------------
-
     _verifier_signature(body, x_mollie_signature)
 
-    # Webhook "organisation" Mollie : corps JSON { "type": "...", ... }
     try:
         payload = json.loads(body) if body else {}
     except ValueError:
-        logger.warning("Webhook Mollie : corps non-JSON, ignoré.")
         return {"detail": "corps non-JSON"}
 
     event_type = payload.get("type", "")
-
-    # Ping de connectivité envoyé par le bouton "test" de Mollie → on accuse réception
     if event_type == "hook.ping":
         return {"detail": "pong"}
 
-    # TODO : traiter payment-link.paid / payment.paid une fois la structure réelle
-    # connue. Pour l'instant on logge le payload complet (voir log ci-dessus) et on
-    # accuse réception (200) pour éviter les relances Mollie.
-    logger.warning("Webhook Mollie — type=%r pas encore traité — payload=%r", event_type, payload)
+    logger.warning("Webhook Mollie — type=%r reçu (non traité, voir réconciliation)", event_type)
     return {"detail": "reçu", "type": event_type}
 
 
 # ---------------------------------------------------------------------------
-# Diagnostic TEMPORAIRE : inspecter les derniers paiements via l'API Mollie
-# (à retirer ensuite). Protégé par ?key=<ADMIN_KEY>.
+# Diagnostic TEMPORAIRE : inspecter les derniers paiements + orders via l'API.
+# Protégé par ?key=<ADMIN_KEY>. À retirer une fois la solution stabilisée.
 # ---------------------------------------------------------------------------
 
 @router.get("/debug/mollie-payments")
@@ -97,19 +82,15 @@ async def debug_mollie_payments(request: Request) -> dict:
             headers={"Authorization": f"Bearer {api_key}"},
             timeout=15.0,
         )
-    data = resp.json()
-    payments = (data.get("_embedded", {}) or {}).get("payments", [])
+    payments = (resp.json().get("_embedded", {}) or {}).get("payments", [])
 
     for p in payments:
         logger.warning(
-            "Mollie payment — id=%s mode=%s status=%s desc=%r metadata=%r "
-            "orderId=%s amount=%r links=%r",
+            "Mollie payment — id=%s mode=%s status=%s desc=%r orderId=%s amount=%r",
             p.get("id"), p.get("mode"), p.get("status"), p.get("description"),
-            p.get("metadata"), p.get("orderId"), p.get("amount"),
-            list((p.get("_links") or {}).keys()),
+            p.get("orderId"), p.get("amount"),
         )
 
-    # Inspecter l'order associé aux paiements payés (email + lignes produit) — 3 max
     fetched = 0
     for p in payments:
         if p.get("status") != "paid" or not p.get("orderId") or fetched >= 3:
@@ -122,9 +103,7 @@ async def debug_mollie_payments(request: Request) -> dict:
             "Mollie order — id=%s status=%s email=%r prenom=%r nom=%r lignes=%r",
             order.get("id"), order.get("status"),
             billing.get("email"), billing.get("givenName"), billing.get("familyName"),
-            [{"name": l.get("name"), "sku": l.get("sku"),
-              "metadata": l.get("metadata"), "type": l.get("type"),
-              "qty": l.get("quantity")} for l in lines],
+            [{"name": l.get("name"), "sku": l.get("sku")} for l in lines],
         )
 
     return {
@@ -136,8 +115,7 @@ async def debug_mollie_payments(request: Request) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Réconciliation Mollie (remplace le webhook : Webador n'en déclenche aucun)
-# Interroge l'API, crédite les paiements payés non encore traités.
+# Réconciliation Mollie : crédite les paiements payés non encore traités.
 # ?key=<ADMIN_KEY>  &  ?dry_run=1 pour un aperçu sans rien écrire.
 # ---------------------------------------------------------------------------
 
@@ -180,118 +158,11 @@ async def reconcile_mollie(request: Request) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Traitement d'un paiement confirmé
-# ---------------------------------------------------------------------------
-
-async def _traiter_paiement(paiement: dict, order: dict | None = None) -> None:
-    """
-    Parse la référence produit, crée/met à jour l'élève, ajoute la ligne
-    Crédits et envoie le lien espace élève.
-
-    Webador crée des orders Mollie : l'email vient de billingAddress et la
-    référence produit du champ SKU des lignes (champ "référence" dans Webador).
-    """
-    metadata = paiement.get("metadata", {}) or {}
-    email: str = (metadata.get("email") or "").strip().lower()
-    nom: str = (metadata.get("nom") or "").strip()
-    telephone: str = (metadata.get("telephone") or "").strip()
-
-    if order:
-        billing = order.get("billingAddress", {}) or {}
-        if not email:
-            email = (billing.get("email") or "").strip().lower()
-        if not nom:
-            prenom = (billing.get("givenName") or "").strip()
-            famille = (billing.get("familyName") or "").strip()
-            nom = f"{prenom} {famille}".strip()
-        if not telephone:
-            telephone = (billing.get("phone") or "").strip()
-
-    if not email:
-        logger.error("Paiement %s sans email (ni metadata ni billingAddress)", paiement.get("id"))
-        return
-
-    produit = _identifier_produit(order or paiement)
-    if produit is None:
-        logger.warning(
-            "Paiement %s : produit non reconnu dans le catalogue — ignoré", paiement.get("id")
-        )
-        return
-    type_cours, formule = produit
-
-    credits_initiaux, date_expiration = credits_apres_achat(formule, date.today())
-
-    sheets = get_sheets_client()
-    sheets.upsert_eleve(email, nom, telephone, contact_urgence="")
-    sheets.add_credit(
-        email=email,
-        type_cours=type_cours,
-        formule=formule,
-        credits_restants=credits_initiaux,
-        date_expiration=date_expiration,
-        statut="actif",
-    )
-
-    token = creer_token_eleve(email)
-    await envoyer_lien_espace(email=email, nom=nom, token=token)
-
-    logger.info("Paiement %s traité : %s / %s pour %s", paiement.get("id"), type_cours, formule, email)
-
-
-# Mapping nom de produit Webador → (TypeCours, Formule).
-# Webador ne renseigne PAS le SKU : on matche sur le NOM d'affichage de la ligne.
-# Les clés sont lisibles ; la comparaison passe par _normaliser() (apostrophes,
-# espaces, slashs) pour tolérer les variantes typographiques de Webador.
-# ⚠️ À COMPLÉTER/CONFIRMER : voir les noms exacts via le dry_run de réconciliation.
-_CATALOGUE: dict[str, tuple[TypeCours, Formule]] = {
-    "yoga aérien/ashtanga/vinyasa ; séance découverte": (TypeCours.AERIEN_ASHTANGA_VINYASA, Formule.ESSAI),
-    "yoga sonore et yoga aérien": (TypeCours.AERIEN, Formule.C10),
-    "stage yoga aérien": (TypeCours.AERIEN, Formule.STAGE),
-    "séances d'été ashtanga/vinyasa": (TypeCours.ASHTANGA_VINYASA, Formule.C5),
-    "séances d'été yoga aérien": (TypeCours.AERIEN_ETE, Formule.C5),
-    "ashtanga & flow yoga carte de 5": (TypeCours.ASHTANGA_VINYASA, Formule.C5),
-    "ashtanga & flow yoga carte de 10": (TypeCours.ASHTANGA_VINYASA, Formule.C10),
-    "yoga aérien carte de 5": (TypeCours.AERIEN, Formule.C5),
-    "yoga aérien à la carte de 5": (TypeCours.AERIEN, Formule.C5),
-    "yoga aérien carte de 10": (TypeCours.AERIEN, Formule.C10),
-    "yoga aérien à la carte de 10": (TypeCours.AERIEN, Formule.C10),
-}
-
-
-def _normaliser(s: str) -> str:
-    """Normalise un nom de produit pour le matching : minuscules, apostrophes
-    droites, espaces autour des slashs supprimés, espaces multiples réduits."""
-    s = (s or "").strip().lower()
-    s = s.replace("’", "'").replace("‘", "'").replace("`", "'")
-    s = re.sub(r"\s*/\s*", "/", s)
-    s = re.sub(r"\s+", " ", s)
-    return s
-
-
-_CATALOGUE_NORM: dict[str, tuple[TypeCours, Formule]] = {
-    _normaliser(k): v for k, v in _CATALOGUE.items()
-}
-
-
-def _nom_produit(data: dict) -> str:
-    """Nom de la première ligne de commande (ou description en repli)."""
-    lines = data.get("lines") or []
-    nom = (lines[0].get("name") or "") if lines else ""
-    return nom or (data.get("description") or "")
-
-
-def _identifier_produit(data: dict) -> tuple[TypeCours, Formule] | None:
-    """Identifie le produit via le nom de la première ligne (matching normalisé).
-    Retourne None si non présent dans le catalogue."""
-    return _CATALOGUE_NORM.get(_normaliser(_nom_produit(data)))
-
-
 async def _reconcilier_paiement(paiement: dict, order: dict | None, sheets, dry_run: bool) -> dict:
     """
     Traite un paiement payé : identifie le produit, crédite l'élève et envoie le
-    lien espace (sauf si dry_run). Retourne un compte-rendu. La déduplication est
-    à la charge de l'appelant (vérifier paiements_traites_ids avant d'appeler).
+    lien espace (sauf dry_run). Retourne un compte-rendu. La déduplication est à la
+    charge de l'appelant (vérifier paiements_traites_ids avant d'appeler).
     """
     pid = paiement.get("id", "")
     src = order or paiement
@@ -332,27 +203,71 @@ async def _reconcilier_paiement(paiement: dict, order: dict | None, sheets, dry_
 
 
 # ---------------------------------------------------------------------------
+# Catalogue produits Webador → (TypeCours, Formule)
+# Webador ne renseigne PAS le SKU : on matche sur le NOM d'affichage de la ligne.
+# La comparaison passe par _normaliser() (apostrophes, espaces, slashs) pour
+# tolérer les variantes typographiques de Webador.
+# ---------------------------------------------------------------------------
+
+_CATALOGUE: dict[str, tuple[TypeCours, Formule]] = {
+    "yoga aérien/ashtanga/vinyasa ; séance découverte": (TypeCours.AERIEN_ASHTANGA_VINYASA, Formule.ESSAI),
+    # "yoga sonore et yoga aérien": (TypeCours.AERIEN, Formule.STAGE),
+    "stage yoga aérien": (TypeCours.AERIEN, Formule.STAGE),
+    "3 séances offre special": (TypeCours.AERIEN_ASHTANGA_VINYASA, Formule.C3),
+    "séances d'été ashtanga/vinyasa": (TypeCours.ASHTANGA_VINYASA, Formule.C5),
+    "séances d'été yoga aérien": (TypeCours.AERIEN, Formule.C5),
+    "séance personnalisée": (TypeCours.PERSO, Formule.UNITE),
+    "ashtanga & flow yoga carte de 5": (TypeCours.ASHTANGA_VINYASA, Formule.C5),
+    "yoga aérien carte de 5": (TypeCours.AERIEN, Formule.C5),
+    "ashtanga & flow yoga carte de 10": (TypeCours.ASHTANGA_VINYASA, Formule.C10),
+    "yoga aérien carte de 10": (TypeCours.AERIEN, Formule.C10),
+}
+
+
+def _normaliser(s: str) -> str:
+    """Normalise un nom de produit : minuscules, apostrophes droites, espaces
+    autour des slashs supprimés, espaces multiples réduits."""
+    s = (s or "").strip().lower()
+    s = s.replace("’", "'").replace("‘", "'").replace("`", "'")
+    s = re.sub(r"\s*/\s*", "/", s)
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+_CATALOGUE_NORM: dict[str, tuple[TypeCours, Formule]] = {
+    _normaliser(k): v for k, v in _CATALOGUE.items()
+}
+
+
+def _nom_produit(data: dict) -> str:
+    """Nom de la première ligne de commande (ou description en repli)."""
+    lines = data.get("lines") or []
+    nom = (lines[0].get("name") or "") if lines else ""
+    return nom or (data.get("description") or "")
+
+
+def _identifier_produit(data: dict) -> tuple[TypeCours, Formule] | None:
+    """Identifie le produit via le nom de la première ligne (matching normalisé)."""
+    return _CATALOGUE_NORM.get(_normaliser(_nom_produit(data)))
+
+
+# ---------------------------------------------------------------------------
 # Appels API Mollie
 # ---------------------------------------------------------------------------
 
 async def _fetch_order(order_id: str) -> dict:
-    """Récupère un order Mollie avec ses lignes pour avoir le SKU et l'email client."""
+    """Récupère un order Mollie avec ses lignes (email client + produit)."""
     import httpx
 
     api_key = os.environ["MOLLIE_API_KEY"].strip()
     url = f"https://api.mollie.com/v2/orders/{order_id}?embed=lines"
-
     async with httpx.AsyncClient() as client:
         response = await client.get(
-            url,
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=10.0,
+            url, headers={"Authorization": f"Bearer {api_key}"}, timeout=10.0
         )
-
     if response.status_code != 200:
         logger.error("Mollie Orders API %s pour order %s", response.status_code, order_id)
         return {}
-
     return response.json()
 
 
@@ -362,21 +277,13 @@ async def _fetch_paiement(payment_id: str) -> dict:
 
     api_key = os.environ["MOLLIE_API_KEY"].strip()
     url = f"https://api.mollie.com/v2/payments/{payment_id}"
-
     async with httpx.AsyncClient() as client:
         response = await client.get(
-            url,
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=10.0,
+            url, headers={"Authorization": f"Bearer {api_key}"}, timeout=10.0
         )
-
     if response.status_code != 200:
         logger.error("Mollie API %s pour payment %s", response.status_code, payment_id)
-        raise HTTPException(
-            status_code=502,
-            detail=f"Erreur Mollie API : {response.status_code}",
-        )
-
+        raise HTTPException(status_code=502, detail=f"Erreur Mollie API : {response.status_code}")
     return response.json()
 
 
@@ -385,17 +292,12 @@ async def _fetch_paiement(payment_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def _verifier_signature(body: bytes, signature: str | None) -> None:
-    """
-    Vérifie la signature HMAC-SHA256 si MOLLIE_WEBHOOK_SECRET est défini.
-    Si la variable n'est pas présente, la vérification est sautée (dev local).
-    """
+    """Vérifie la signature HMAC-SHA256 si MOLLIE_WEBHOOK_SECRET est défini."""
     secret = os.environ.get("MOLLIE_WEBHOOK_SECRET", "")
     if not secret:
         return
-
     if not signature:
         raise HTTPException(status_code=401, detail="Signature manquante.")
-
     expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(expected, signature):
         raise HTTPException(status_code=401, detail="Signature invalide.")
