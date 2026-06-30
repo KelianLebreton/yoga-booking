@@ -89,7 +89,7 @@ async def debug_mollie_payments(request: Request) -> dict:
     if not admin_key or request.query_params.get("key") != admin_key:
         raise HTTPException(status_code=403, detail="Clé invalide.")
 
-    api_key = os.environ["MOLLIE_API_KEY"]
+    api_key = os.environ["MOLLIE_API_KEY"].strip()
     async with httpx.AsyncClient() as client:
         resp = await client.get(
             "https://api.mollie.com/v2/payments?limit=10",
@@ -219,7 +219,7 @@ async def _fetch_order(order_id: str) -> dict:
     """Récupère un order Mollie avec ses lignes pour avoir le SKU et l'email client."""
     import httpx
 
-    api_key = os.environ["MOLLIE_API_KEY"]
+    api_key = os.environ["MOLLIE_API_KEY"].strip()
     url = f"https://api.mollie.com/v2/orders/{order_id}?embed=lines"
 
     async with httpx.AsyncClient() as client:
@@ -240,7 +240,7 @@ async def _fetch_paiement(payment_id: str) -> dict:
     """Récupère les détails d'un paiement via l'API Mollie REST."""
     import httpx
 
-    api_key = os.environ["MOLLIE_API_KEY"]
+    api_key = os.environ["MOLLIE_API_KEY"].strip()
     url = f"https://api.mollie.com/v2/payments/{payment_id}"
 
     async with httpx.AsyncClient() as client:
